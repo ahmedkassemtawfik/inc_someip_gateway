@@ -37,7 +37,35 @@ Result<std::unique_ptr<Routing>> Routing::Create() {
     return routing;
 }
 
+namespace {
+
+void LogOffer(Routing::LocalInstance const& local_instance, bool const offered) {
+    if (offered) {
+        score::mw::log::LogInfo() << "[someipd] Offering service 0x"
+                                  << score::mw::log::LogHex16{local_instance.service}
+                                  << " instance 0x"
+                                  << score::mw::log::LogHex16{local_instance.instance};
+    } else {
+        score::mw::log::LogInfo() << "[someipd] Stopping the offer of service 0x"
+                                  << score::mw::log::LogHex16{local_instance.service}
+                                  << " instance 0x"
+                                  << score::mw::log::LogHex16{local_instance.instance};
+    }
+}
+
+}  // namespace
+
+bool Routing::IsRegistered() {
+    std::lock_guard const lock{mutex_};
+    return registered_;
+}
+
 void Routing::SetupOfferings(score::mw_someip_config::Root const& config) {
+    std::lock_guard const offer_lock{offer_mutex_};
+    if (!IsRegistered()) {
+        return;
+    }
+    std::set<vsomeip::service_t> set_up{};
     for (const auto* const service_type : *config.service_types()) {
         const auto* service_instances = service_type->local_service_instances();
         if ((service_instances != nullptr) && !service_instances->empty()) {
@@ -59,15 +87,39 @@ void Routing::SetupOfferings(score::mw_someip_config::Root const& config) {
                                               local_service_instance->instance_id(),
                                               event->event_id(), groups);
                 }
-                score::mw::log::LogInfo()
-                    << "[someipd] Offering service 0x"
-                    << score::mw::log::LogHex16{service_type->service_id()} << " instance 0x"
-                    << score::mw::log::LogHex16{local_service_instance->instance_id()};
-                application_->offer_service(service_type->service_id(),
-                                            local_service_instance->instance_id(),
-                                            service_type->service_version_major());
             }
+            set_up.insert(service_type->service_id());
         }
+    }
+    services_with_events_.insert(set_up.cbegin(), set_up.cend());
+
+    // Offer what became available before the events could be registered (or before this
+    // registration). Everything else is offered by SetLocalOffer() when it becomes available.
+    for (auto const& local_instance : wanted_offers_) {
+        if (set_up.count(local_instance.service) != 0U) {
+            LogOffer(local_instance, true);
+            application_->offer_service(local_instance.service, local_instance.instance,
+                                        local_instance.major);
+        }
+    }
+}
+
+void Routing::SetLocalOffer(LocalInstance const& local_instance, bool const offered) {
+    std::lock_guard const offer_lock{offer_mutex_};
+    bool const changed = offered ? wanted_offers_.insert(local_instance).second
+                                 : (wanted_offers_.erase(local_instance) != 0U);
+    if (!changed || !IsRegistered() ||
+        (services_with_events_.count(local_instance.service) == 0U)) {
+        // Nothing to do, or SetupOfferings() applies the wish later.
+        return;
+    }
+    LogOffer(local_instance, offered);
+    if (offered) {
+        application_->offer_service(local_instance.service, local_instance.instance,
+                                    local_instance.major);
+    } else {
+        application_->stop_offer_service(local_instance.service, local_instance.instance,
+                                         local_instance.major);
     }
 }
 
@@ -89,9 +141,13 @@ void Routing::Run(const std::function<void()>& wait_for_shutdown) {
     application_->register_state_handler([this](vsomeip::state_type_e state) {
         std::vector<Services> services{};
         {
+            std::lock_guard const offer_lock{offer_mutex_};
             std::lock_guard const lock{mutex_};
             registered_ = (state == vsomeip::state_type_e::ST_REGISTERED);
             if (!registered_) {
+                // SetupOfferings() registers the events again on the next ST_REGISTERED, and
+                // only then re-offers the wanted instances.
+                services_with_events_.clear();
                 return;
             }
             services = services_;

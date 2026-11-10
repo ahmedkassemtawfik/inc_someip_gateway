@@ -74,17 +74,29 @@ bool GatewaydServices::Add(
             !service_type_config->local_service_instances()->empty()) {
             // TODO: handle multiple instances. Bridged services and LocalNetworkService
             // currently use service_type_name as the SOCom Service_instance (one connector
-            // per service type); Routing::SetupOfferings still offers all instances on SOME/IP.
+            // per service type), so the availability of that one connector switches the
+            // SOME/IP offer of all local instances of the service type.
             auto const* const service_instance_config =
                 *service_type_config->local_service_instances()->begin();
+            std::vector<Routing::LocalInstance> local_instances{};
+            for (auto const* const instance : *service_type_config->local_service_instances()) {
+                local_instances.push_back({service_type_config->service_id(),
+                                           instance->instance_id(),
+                                           service_type_config->service_version_major()});
+            }
+            auto set_offered = [&routing = routing_, local_instances](bool const offered) {
+                for (auto const& local_instance : local_instances) {
+                    routing.SetLocalOffer(local_instance, offered);
+                }
+            };
             score::mw::log::LogInfo()
                 << "[someipd] Creating LocalNetworkService: "
                 << service_type_config->service_type_name()->string_view() << " service_id=0x"
                 << score::mw::log::LogHex16{service_type_config->service_id()} << " instance_id=0x"
                 << score::mw::log::LogHex16{service_instance_config->instance_id()};
-            auto created =
-                LocalNetworkService::Create({config, service_instance_config}, service_type,
-                                            routing_.get_application(), socom_runtime_);
+            auto created = LocalNetworkService::Create({config, service_instance_config},
+                                                       service_type, routing_.get_application(),
+                                                       std::move(set_offered), socom_runtime_);
             if (!created.has_value()) {
                 score::mw::log::LogError()
                     << "[someipd] Failed to create LocalNetworkService for "

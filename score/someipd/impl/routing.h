@@ -17,7 +17,9 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include <vsomeip/vsomeip.hpp>
 
@@ -28,11 +30,23 @@ namespace score::someipd {
 
 /// Manages the vsomeip application lifecycle and SOME/IP service registrations.
 ///
-/// Owns a vsomeip application instance, offers the services that gatewayds add at runtime,
-/// and dispatches incoming SOME/IP messages. IPC forwarding to/from gatewayd is handled via
-/// SOCom connectors that are wired in externally (see GatewaydServices).
+/// Owns a vsomeip application instance, registers the events of the services that gatewayds add
+/// at runtime, offers their local instances while they are available (see SetLocalOffer()), and
+/// dispatches incoming SOME/IP messages. IPC forwarding to/from gatewayd is handled via SOCom
+/// connectors that are wired in externally (see GatewaydServices).
 class Routing {
    public:
+    /// Identifies a local service instance on SOME/IP
+    struct LocalInstance {
+        vsomeip::service_t service;
+        vsomeip::instance_t instance;
+        vsomeip::major_version_t major;
+
+        bool operator<(LocalInstance const& other) const noexcept {
+            return std::tie(service, instance) < std::tie(other.service, other.instance);
+        }
+    };
+
     /// @brief Creates a Routing instance.
     ///
     /// Initialises a vsomeip application and registers it with the vsomeip runtime.
@@ -53,13 +67,21 @@ class Routing {
     /// Returns the vsomeip application instance.
     std::shared_ptr<vsomeip::application> get_application() const noexcept { return application_; }
 
-    /// \brief Offers the local service instances of @p config, then calls @p on_registered
+    /// \brief Registers the events of the local service instances of @p config, then calls
+    ///        @p on_registered
     /// \details Both run now if vsomeip is registered, and again on every ST_REGISTERED.
+    ///          The instances themselves are offered only while SetLocalOffer() wants them.
     ///          Thread safe.
     /// \param on_registered MUST NOT be empty. Use it to call setup_vsomeip() on
     ///        RemoteNetworkService instances.
     void AddServices(std::shared_ptr<const score::mw_someip_config::Root> config,
                      std::function<void()> on_registered);
+
+    /// \brief Offers or withdraws a local service instance on SOME/IP
+    /// \details The wish is kept. It takes effect once vsomeip is registered and the events of
+    ///          the service have been registered by AddServices(), and again on every
+    ///          ST_REGISTERED. Withdrawing sends a StopOfferService. Thread safe.
+    void SetLocalOffer(LocalInstance const& local_instance, bool offered);
 
     /// Starts the network stack, blocks in @p wait_for_shutdown, then stops the stack.
     /// \param wait_for_shutdown Blocks until shutdown is requested.
@@ -72,7 +94,10 @@ class Routing {
     };
 
     Routing() = default;
+    /// Registers the events of the local instances of @p config, then offers those instances
+    /// that SetLocalOffer() wants
     void SetupOfferings(score::mw_someip_config::Root const& config);
+    bool IsRegistered();
 
     std::shared_ptr<vsomeip::application> application_{};
     std::shared_ptr<vsomeip::payload> payload_{};
@@ -81,6 +106,15 @@ class Routing {
     std::mutex mutex_{};
     bool registered_{false};
     std::vector<Services> services_{};
+
+    /// Serializes all offer_service() and stop_offer_service() calls, so that a withdrawal is
+    /// never overtaken by a re-offer. Guards wanted_offers_ and services_with_events_.
+    /// Lock order: offer_mutex_ before mutex_.
+    std::mutex offer_mutex_{};
+    /// Local instances that SetLocalOffer() wants offered
+    std::set<LocalInstance> wanted_offers_{};
+    /// Services whose events SetupOfferings() registered in the current registration
+    std::set<vsomeip::service_t> services_with_events_{};
 };
 
 }  // namespace score::someipd

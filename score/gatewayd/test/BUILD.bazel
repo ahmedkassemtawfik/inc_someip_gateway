@@ -11,7 +11,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # *******************************************************************************
 
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_test")
+
+# Provides a local service, so that gatewayd bridges it and someipd offers it on SOME/IP.
+cc_binary(
+    name = "local_service_provider",
+    testonly = True,
+    srcs = ["local_service_provider.cpp"],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = [
+        "//score/serializer:pre_serialized_data",
+        "@score_baselibs//score/filesystem",
+        "@score_communication//score/mw/com",
+    ],
+)
 
 py_test(
     name = "gatewayd_test",
@@ -22,8 +36,10 @@ py_test(
         "$(location //score/config:config_file)",
         "$(location //score/gatewayd:etc/mw_com_config.json)",
         "$(location //score/someipd:etc/mw_com_config.json)",
+        "$(location :local_service_provider)",
     ],
     data = [
+        ":local_service_provider",
         "//score/config:config_file",
         "//score/gatewayd",
         "//score/gatewayd:etc/mw_com_config.json",
